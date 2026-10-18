@@ -1,0 +1,13 @@
+# Which listings you want to hear about. Empty list = no filter on that field.
+[filters]
+countries = ["Netherlands"]
+cities = ["Utrecht"]
+
+# Which sites to watch: "plaza", "fizz"
+[sources]
+enabled = ["plaza", "fizz"]
+
+# Polling interval in seconds; each wait is random between min and max.
+[watch]
+interval_min = 60
+interval_max = 120
