@@ -9,6 +9,7 @@ or /plaza, /fizz for a single site.
 Each site is checked and backed off independently, so one site failing doesn't affect the others.
 """
 import argparse
+import html
 import logging
 import random
 import time
@@ -20,12 +21,15 @@ import httpx
 from house_agent.filters import Filters, load_config, load_filters
 from house_agent.fizz import listings as fizz
 from house_agent.models import Listing
+from house_agent.plaza import apply as plaza_apply
 from house_agent.plaza import listings as plaza
+from house_agent.plaza.session import ensure_logged_in
 from house_agent.store import Store
-from house_agent.telegram import Telegram, format_list, format_listing
+from house_agent.telegram import CONFLICT, Telegram, TelegramError, format_list, format_listing
 
 log = logging.getLogger("watch")
-COMMAND_POLL_SECONDS = 5  # how often to check Telegram for /list while sleeping
+COMMAND_POLL_SECONDS = 5  # pause after a failed Telegram poll
+LONG_POLL_SECONDS = 25  # Telegram holds the request open until a command/tap arrives (max this long)
 BLOCKED_STATUSES = {403, 429, 503}  # rate limited or Cloudflare challenge
 BACKOFF_START = 10 * 60  # first wait after being blocked; doubles each time
 BACKOFF_MAX = 2 * 60 * 60
@@ -52,24 +56,90 @@ class Source:
         return SITE_NAMES.get(self.site, self.site)
 
 
-def check(source: Source, store: Store, tg: Telegram, filters: Filters, announce: bool) -> None:
+APPLY_PREFIX = "apply:"
+
+
+def can_apply(listing: Listing, config: dict) -> bool:
+    return listing.site == "plaza" and config.get("apply", {}).get("enabled", False)
+
+
+def check(source: Source, store: Store, tg: Telegram, filters: Filters, announce: bool, config: dict) -> None:
     listings = [l for l in source.fetch(filters) if filters.matches(l)]
     new, gone = store.sync(source.site, listings)
     source.latest = listings
     log.info("%s: %d matching listings, %d new, %d gone", source.name, len(listings), len(new), len(gone))
     if announce:
+        if any(can_apply(l, config) for l in new):
+            warm_up_login()
         for l in new:
-            tg.send("🆕 " + format_listing(l))
+            buttons = [("⚡ Apply now", APPLY_PREFIX + l.key)] if can_apply(l, config) else None
+            tg.send("🆕 " + format_listing(l), buttons=buttons)
         for l in gone:
             tg.send(f"❌ No longer listed on {source.name}: {l.address}, {l.city}")
 
 
-def check_safely(source: Source, store: Store, tg: Telegram, filters: Filters, announce: bool) -> None:
+def warm_up_login() -> None:
+    """Make sure the Plaza session is valid *before* you tap Apply, so the tap is instant."""
+    try:
+        ensure_logged_in().close()
+    except Exception:
+        log.exception("Could not refresh the Plaza login; Apply will retry it when tapped")
+
+
+def handle_apply(tg: Telegram, store: Store, config: dict, key: str, message_id: int,
+                 keyboard: list[list[dict]] | None = None) -> None:
+    """You tapped "Apply now": react on Plaza, with safety checks."""
+    listing = store.listing(key)
+    label = html.escape(f"{listing.address}, {listing.city}" if listing else key)
+    site, _, listing_id = key.partition(":")
+    max_per_day = config.get("apply", {}).get("max_per_day", 3)
+
+    if site != "plaza" or not config.get("apply", {}).get("enabled", False):
+        tg.send(f"❌ Applying isn't enabled for {label}.", reply_to=message_id)
+        return
+    if store.has_applied(key):
+        tg.send(f"ℹ️ You already applied to {label}.", reply_to=message_id)
+        return
+    if store.applications_today() >= max_per_day:
+        tg.send(f"🛑 Daily limit of {max_per_day} applications reached — not applying to {label}. "
+                "Use the link to apply on the website, or raise max_per_day in config.toml.", reply_to=message_id)
+        return
+
+    tg.remove_button(message_id, keyboard or [], APPLY_PREFIX + key)  # no double taps
+    try:
+        client = ensure_logged_in()
+        try:
+            result = plaza_apply.react(client, listing_id)
+        finally:
+            client.close()
+    except plaza_apply.ApplyError as e:
+        store.record_application(key, False, str(e))
+        tg.send(f"❌ Not applied to {label}: {html.escape(str(e))}", reply_to=message_id)
+        return
+    except Exception as e:
+        log.exception("Apply failed for %s", key)
+        store.record_application(key, False, repr(e))
+        tg.send(f"❌ Applying to {label} failed ({type(e).__name__}). Apply on the website now: "
+                f'<a href="{html.escape(listing.url) if listing else ""}">open listing</a>', reply_to=message_id)
+        return
+
+    store.record_application(key, result.ok, result.message)
+    position = f"\nYour provisional position: <b>{result.position}</b>" if result.position else ""
+    plaza_says = f"\nPlaza says: {html.escape(result.message)}" if result.message else ""
+    if result.ok:
+        tg.send(f"✅ Applied to {label} in {result.seconds:.1f}s.{position}{plaza_says}", reply_to=message_id)
+    else:
+        tg.send(f"⚠️ Sent the reaction for {label}, but Plaza doesn't confirm it.{plaza_says}\n"
+                "Check “Mijn reacties” on the website.", reply_to=message_id)
+
+
+def check_safely(source: Source, store: Store, tg: Telegram, filters: Filters, announce: bool,
+                 config: dict) -> None:
     """Run one check and handle errors/backoff for this source only."""
     if time.time() < source.paused_until:
         return
     try:
-        check(source, store, tg, filters, announce)
+        check(source, store, tg, filters, announce, config)
         if source.backoff or source.failures >= WARN_AFTER_FAILURES:
             notify(tg, f"✅ {source.name} is reachable again, back to normal checking.")
         source.backoff = source.failures = 0
@@ -89,28 +159,66 @@ def check_safely(source: Source, store: Store, tg: Telegram, filters: Filters, a
         record_failure(tg, source, e)
 
 
-def send_lists(tg: Telegram, sources: list[Source]) -> None:
-    """One message (or a few, if long) per site."""
+MAX_LIST_BUTTONS = 20  # keep the keyboard under a long list usable
+
+
+def send_lists(tg: Telegram, sources: list[Source], store: Store, config: dict) -> None:
+    """One message (or a few, if long) per site, with an Apply button per listing where possible."""
     for s in sources:
-        notify(tg, format_list(f"Currently available on {s.name}", s.latest))
+        buttons = [
+            (f"⚡ Apply: {l.address}"[:60], APPLY_PREFIX + l.key)
+            for l in s.latest
+            if can_apply(l, config) and not store.has_applied(l.key)
+        ][:MAX_LIST_BUTTONS]
+        try:
+            tg.send(format_list(f"Currently available on {s.name}", s.latest), buttons=buttons or None)
+        except httpx.HTTPError as e:
+            log.warning("Could not send %s list: %s", s.name, e)
 
 
-def sleep_and_answer_commands(seconds: float, tg: Telegram, sources: list[Source]) -> None:
+def sleep_and_answer_commands(seconds: float, tg: Telegram, sources: list[Source], store: Store,
+                              config: dict) -> None:
+    """Wait until the next check, reacting instantly to commands and button taps (long polling)."""
     by_command = {f"/{s.site}": s for s in sources}
     end = time.time() + seconds
-    while time.time() < end:
+    while (remaining := end - time.time()) > 0:
         try:
-            for cmd in tg.commands():
-                if cmd == "/list":
-                    send_lists(tg, sources)
-                elif cmd in by_command:
-                    send_lists(tg, [by_command[cmd]])
-                elif cmd in ("/start", "/help"):
+            for ev in tg.events(timeout=int(min(remaining, LONG_POLL_SECONDS))):
+                if ev["type"] == "button":
+                    if ev["data"].startswith(APPLY_PREFIX):
+                        tg.answer_callback(ev["callback_id"], "Applying…")
+                        handle_apply(tg, store, config, ev["data"][len(APPLY_PREFIX):], ev["message_id"],
+                                     ev["keyboard"])
+                    else:
+                        tg.answer_callback(ev["callback_id"])
+                elif ev["command"] == "/list":
+                    send_lists(tg, sources, store, config)
+                elif ev["command"] in by_command:
+                    send_lists(tg, [by_command[ev["command"]]], store, config)
+                elif ev["command"] in ("/start", "/help"):
                     site_cmds = "\n".join(f"{c} – only {s.name}" for c, s in by_command.items())
                     tg.send(f"Commands:\n/list – everything that matches your filters, per site\n{site_cmds}")
+        except TelegramError as e:
+            if e.status == CONFLICT:
+                warn_about_second_copy(tg)
+            else:
+                log.warning("%s", e)
+            time.sleep(min(COMMAND_POLL_SECONDS, max(0, end - time.time())))
         except httpx.HTTPError as e:
-            log.warning("Telegram poll failed: %s", e)
-        time.sleep(min(COMMAND_POLL_SECONDS, max(0, end - time.time())))
+            log.warning("Telegram poll failed: %s", type(e).__name__)
+            time.sleep(min(COMMAND_POLL_SECONDS, max(0, end - time.time())))
+
+
+_second_copy_warned = False
+
+
+def warn_about_second_copy(tg: Telegram) -> None:
+    global _second_copy_warned
+    log.warning("409 Conflict: another program is polling this Telegram bot")
+    if not _second_copy_warned:
+        _second_copy_warned = True
+        notify(tg, "⚠️ Another copy of the watcher is running with this bot. Only one of them receives "
+                   "your button taps and commands — stop the other one.")
 
 
 def main() -> None:
@@ -118,6 +226,8 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="check once and exit")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # httpx logs every request URL at INFO, and Telegram URLs contain the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     config = load_config()
     filters = load_filters(config)
@@ -128,19 +238,41 @@ def main() -> None:
     if not tg.chat_id:
         raise SystemExit("❌ No TELEGRAM_CHAT_ID yet. Run: uv run python -m house_agent.telegram")
     store = Store()
-    tg.get_updates()  # skip commands sent while we weren't running
+    skip_old_updates(tg)
 
     first_round = True  # first round: a summary per site instead of per-listing messages
     while True:
         for source in sources:
-            check_safely(source, store, tg, filters, announce=not first_round)
+            check_safely(source, store, tg, filters, announce=not first_round, config=config)
         if first_round:
-            send_lists(tg, sources)
+            send_lists(tg, sources, store, config)
             first_round = False
         if args.once:
             break
         wait = random.uniform(interval.get("interval_min", 60), interval.get("interval_max", 120))
-        sleep_and_answer_commands(wait, tg, sources)
+        sleep_and_answer_commands(wait, tg, sources, store, config)
+
+
+def skip_old_updates(tg: Telegram) -> None:
+    """Skip commands/taps sent while we weren't running.
+
+    Right after a restart the previous copy's long poll can still be open for a few seconds,
+    which Telegram answers with 409 Conflict — so wait that out instead of crashing.
+    """
+    deadline = time.time() + LONG_POLL_SECONDS + 10
+    while True:
+        try:
+            tg.get_updates()
+            return
+        except TelegramError as e:
+            if e.status != CONFLICT or time.time() > deadline:
+                raise SystemExit(
+                    "❌ Another program is polling this Telegram bot (409 Conflict). "
+                    "Only one watcher can run per bot — stop the other copy (another terminal, a server…)."
+                    if e.status == CONFLICT else f"❌ {e}"
+                )
+            log.warning("Telegram says another copy is still polling; waiting for it to stop…")
+            time.sleep(5)
 
 
 def record_failure(tg: Telegram, source: Source, error: Exception) -> None:

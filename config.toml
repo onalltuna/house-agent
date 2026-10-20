@@ -7,6 +7,12 @@ cities = ["Utrecht"]
 [sources]
 enabled = ["plaza", "fizz"]
 
+# Semi-automatic applying (Plaza only): new Plaza listings get an "Apply now" button in Telegram.
+# Nothing is ever sent without you tapping it.
+[apply]
+enabled = true
+max_per_day = 3  # safety cap on successful reactions per day
+
 # Polling interval in seconds; each wait is random between min and max.
 [watch]
 interval_min = 60

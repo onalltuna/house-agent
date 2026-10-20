@@ -13,6 +13,15 @@ from dotenv import load_dotenv, set_key
 from house_agent.models import Listing
 
 MAX_MESSAGE_LEN = 4000  # Telegram's hard limit is 4096
+CONFLICT = 409  # another program is polling the same bot
+
+
+class TelegramError(httpx.HTTPError):
+    """A failed Bot API call. The message never contains the URL, because the URL contains the bot token."""
+
+    def __init__(self, method: str, status: int | None, description: str):
+        super().__init__(f"Telegram {method} failed ({status}): {description}")
+        self.status = status
 
 
 class Telegram:
@@ -22,6 +31,19 @@ class Telegram:
         self.http = httpx.Client(timeout=40)
         self.update_offset = 0
 
+    def _call(self, method: str, json: dict | None = None, params: dict | None = None) -> dict:
+        try:
+            r = self.http.post(f"{self.api}/{method}", json=json, params=params)
+        except httpx.HTTPError as e:
+            raise TelegramError(method, None, type(e).__name__) from None
+        if r.status_code != 200:
+            try:
+                description = r.json().get("description", "")
+            except ValueError:
+                description = r.text[:200]
+            raise TelegramError(method, r.status_code, description)
+        return r.json()
+
     @classmethod
     def from_env(cls) -> "Telegram":
         load_dotenv(".env")
@@ -30,33 +52,63 @@ class Telegram:
             sys.exit("❌ Set TELEGRAM_BOT_TOKEN in .env")
         return cls(token, os.getenv("TELEGRAM_CHAT_ID"))
 
-    def send(self, text: str) -> None:
-        """Send HTML text, split over several messages if it's too long."""
-        for chunk in _chunks(text):
-            r = self.http.post(
-                f"{self.api}/sendMessage",
-                json={"chat_id": self.chat_id, "text": chunk, "parse_mode": "HTML",
-                      "disable_web_page_preview": True},
-            )
-            r.raise_for_status()
+    def send(self, text: str, buttons: list[tuple[str, str]] | None = None,
+             reply_to: int | None = None) -> None:
+        """Send HTML text, split over several messages if it's too long.
+
+        `buttons` are (label, callback_data) pairs shown under the last message, one per row.
+        """
+        chunks = _chunks(text)
+        for i, chunk in enumerate(chunks):
+            payload = {"chat_id": self.chat_id, "text": chunk, "parse_mode": "HTML",
+                       "disable_web_page_preview": True}
+            if buttons and i == len(chunks) - 1:
+                payload["reply_markup"] = {"inline_keyboard": [[{"text": t, "callback_data": d}] for t, d in buttons]}
+            if reply_to and i == 0:
+                payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+            self._call("sendMessage", json=payload)
+
+    def answer_callback(self, callback_id: str, text: str = "") -> None:
+        """Stop the button's loading spinner (and optionally show a short toast)."""
+        try:
+            self._call("answerCallbackQuery", json={"callback_query_id": callback_id, "text": text})
+        except TelegramError:
+            pass  # cosmetic only
+
+    def remove_button(self, message_id: int, keyboard: list[list[dict]], data: str) -> None:
+        """Remove one button (by its callback data) from a message, keeping the others."""
+        rows = [[b for b in row if b.get("callback_data") != data] for row in keyboard]
+        try:
+            self._call("editMessageReplyMarkup",
+                       json={"chat_id": self.chat_id, "message_id": message_id,
+                             "reply_markup": {"inline_keyboard": [r for r in rows if r]}})
+        except TelegramError:
+            pass  # e.g. message too old to edit; the duplicate check still prevents double applying
 
     def get_updates(self, timeout: int = 0) -> list[dict]:
-        r = self.http.get(f"{self.api}/getUpdates", params={"offset": self.update_offset, "timeout": timeout})
-        r.raise_for_status()
-        updates = r.json()["result"]
+        updates = self._call("getUpdates", params={"offset": self.update_offset, "timeout": timeout})["result"]
         if updates:
             self.update_offset = updates[-1]["update_id"] + 1
         return updates
 
-    def commands(self) -> list[str]:
-        """Return commands like '/list' sent by our chat since the last call."""
-        return [
-            u["message"]["text"].split()[0].split("@")[0].lower()
-            for u in self.get_updates()
-            if "message" in u
-            and str(u["message"]["chat"]["id"]) == str(self.chat_id)
-            and u["message"].get("text", "").startswith("/")
-        ]
+    def events(self, timeout: int = 0) -> list[dict]:
+        """Commands and button taps from our chat.
+
+        With timeout > 0 this long-polls: it returns as soon as something arrives, so a tap on
+        a button is handled within a fraction of a second.
+        Returns dicts: {"type": "command", "command": "/list"} or
+        {"type": "button", "data": "...", "callback_id": "...", "message_id": 123, "keyboard": [...]}.
+        """
+        events = []
+        for u in self.get_updates(timeout):
+            if (msg := u.get("message")) and str(msg["chat"]["id"]) == str(self.chat_id):
+                if msg.get("text", "").startswith("/"):
+                    events.append({"type": "command", "command": msg["text"].split()[0].split("@")[0].lower()})
+            elif (cb := u.get("callback_query")) and str(cb["message"]["chat"]["id"]) == str(self.chat_id):
+                events.append({"type": "button", "data": cb.get("data", ""), "callback_id": cb["id"],
+                               "message_id": cb["message"]["message_id"],
+                               "keyboard": (cb["message"].get("reply_markup") or {}).get("inline_keyboard", [])})
+        return events
 
 
 def _chunks(text: str) -> list[str]:

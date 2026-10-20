@@ -23,6 +23,37 @@ class Store:
                 active INTEGER NOT NULL DEFAULT 1
             )"""
         )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS applications (
+                key TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                detail TEXT
+            )"""
+        )
+
+    def has_applied(self, key: str) -> bool:
+        return self.db.execute("SELECT 1 FROM applications WHERE key = ? AND ok = 1", (key,)).fetchone() is not None
+
+    def applications_today(self) -> int:
+        today = datetime.now().date().isoformat()
+        return self.db.execute(
+            "SELECT COUNT(*) FROM applications WHERE ok = 1 AND applied_at >= ?", (today,)
+        ).fetchone()[0]
+
+    def record_application(self, key: str, ok: bool, detail: str) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO applications (key, applied_at, ok, detail) VALUES (?, ?, ?, ?)",
+                (key, datetime.now().isoformat(timespec="seconds"), int(ok), detail),
+            )
+
+    def listing(self, key: str) -> Listing | None:
+        row = self.db.execute("SELECT data FROM listings WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        d = json.loads(row[0])
+        return Listing(**{**d, "target_groups": tuple(d["target_groups"])})
 
     def sync(self, site: str, listings: list[Listing]) -> tuple[list[Listing], list[Listing]]:
         """Record the current listings of one site. Returns (new, gone) compared to its last sync.

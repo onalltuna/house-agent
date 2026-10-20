@@ -65,7 +65,20 @@ which only comes back when you're logged in. So the flow is:
 2. `getdynamicdata` / `getobject` for the listing → `reactionData.url` + form `__hash__`
 3. `POST react` with those params
 
-### Still TODO (needs your account)
+### React request — worked out 2026-10-20 (implemented in `house_agent/plaza/apply.py`)
+Found from the JS + read-only calls with the logged-in session (no test reaction sent):
+1. `POST /portal/object/frontend/getreagerendata/format/json` form `objectId[]=<id>` →
+   `{"reagerenData": {"<id>": {"kanReageren": true, "action": "add", "url": "?add=12194&dwellingID=<id>",
+   "voorlopigePositie": null, "kanMotiveren": false}}}` (`action` becomes something else once reacted)
+2. `GET /portal/core/frontend/getformsubmitonlyconfiguration/format/json` →
+   form `Portal_Form_SubmitOnly` with `__hash__.initialData`
+3. `POST /portal/object/frontend/react/format/json`, form-encoded, header `X-Requested-With: XMLHttpRequest`:
+   `__id__=Portal_Form_SubmitOnly&__hash__=<hash>&add=12194&dwellingID=<id>`
+   (+ `motivatie` only when a motivation is required — we don't auto-apply those).
+Response shape of step 3 not yet seen; the code re-checks step 1 afterwards to confirm.
+Allocation per Plaza's FAQ: first to react **whose documents are approved** gets the offer.
+
+### Originally TODO (needs your account) — superseded by option B (browser login)
 The login request URL is built at runtime, so it isn't visible in the static JS. Capture it once:
 1. Open Chrome → DevTools → **Network** tab, tick **Preserve log**, filter **Fetch/XHR**.
 2. Log in to Plaza.
