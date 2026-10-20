@@ -23,7 +23,7 @@ from house_agent.fizz import listings as fizz
 from house_agent.models import Listing
 from house_agent.plaza import apply as plaza_apply
 from house_agent.plaza import listings as plaza
-from house_agent.plaza.session import ensure_logged_in
+from house_agent.plaza.session import LoginError, ensure_logged_in, get_account
 from house_agent.store import Store
 from house_agent.telegram import CONFLICT, Telegram, TelegramError, format_list, format_listing
 
@@ -78,12 +78,62 @@ def check(source: Source, store: Store, tg: Telegram, filters: Filters, announce
             tg.send(f"❌ No longer listed on {source.name}: {l.address}, {l.city}")
 
 
-def warm_up_login() -> None:
+SESSION_FRESH_SECONDS = 5 * 60  # trust a session we verified this recently without re-checking
+SESSION_KEEPALIVE_SECONDS = 10 * 60  # how often to verify the session in the background
+LOGIN_RETRY_SECONDS = 30 * 60  # after a failed login, wait this long before trying again
+
+
+class PlazaSession:
+    """One logged-in Plaza client kept open, so a tap doesn't pay for a login or new connections.
+
+    Failed logins are rate limited: repeated failed logins are what gets accounts locked.
+    """
+
+    def __init__(self):
+        self.client: httpx.Client | None = None
+        self.verified_at = 0.0
+        self.login_failed_at = 0.0
+        self.on_login_failure: Callable[[str], None] | None = None
+
+    def get(self, max_age: float = SESSION_FRESH_SECONDS) -> httpx.Client:
+        if self.client and time.time() - self.verified_at < max_age:
+            return self.client
+        if self.client:
+            try:
+                if get_account(self.client):
+                    self.verified_at = time.time()
+                    return self.client
+            except (httpx.HTTPError, ValueError):
+                pass
+            self.client.close()
+            self.client = None
+        wait = self.login_failed_at + LOGIN_RETRY_SECONDS - time.time()
+        if wait > 0:
+            raise LoginError(f"Plaza login failed recently; not retrying for another {wait / 60:.0f} min.")
+        log.info("Logging in to Plaza…")
+        try:
+            self.client = ensure_logged_in()  # browser login only if the saved cookies stopped working
+        except Exception as e:
+            self.login_failed_at = time.time()
+            if self.on_login_failure:
+                self.on_login_failure(str(e))
+            raise
+        self.login_failed_at = 0.0
+        self.verified_at = time.time()
+        return self.client
+
+
+plaza_session = PlazaSession()
+
+
+def warm_up_login(max_age: float = 0) -> None:
     """Make sure the Plaza session is valid *before* you tap Apply, so the tap is instant."""
     try:
-        ensure_logged_in().close()
+        plaza_session.get(max_age)
+    except LoginError as e:
+        log.warning("%s", e)
     except Exception:
-        log.exception("Could not refresh the Plaza login; Apply will retry it when tapped")
+        log.exception("Could not refresh the Plaza login")
 
 
 def handle_apply(tg: Telegram, store: Store, config: dict, key: str, message_id: int,
@@ -105,14 +155,16 @@ def handle_apply(tg: Telegram, store: Store, config: dict, key: str, message_id:
                 "Use the link to apply on the website, or raise max_per_day in config.toml.", reply_to=message_id)
         return
 
+    tapped = time.monotonic()
     tg.remove_button(message_id, keyboard or [], APPLY_PREFIX + key)  # no double taps
     try:
-        client = ensure_logged_in()
-        try:
-            result = plaza_apply.react(client, listing_id)
-        finally:
-            client.close()
+        client = plaza_session.get()
+        session_ready = time.monotonic() - tapped
+        result = plaza_apply.react(client, listing_id)
+        log.info("Apply %s: ok=%s, session ready after %.1fs, reaction sent after %.1fs (total %.1fs)",
+                 key, result.ok, session_ready, result.seconds, time.monotonic() - tapped)
     except plaza_apply.ApplyError as e:
+        log.info("Apply %s refused: %s", key, e)
         store.record_application(key, False, str(e))
         tg.send(f"❌ Not applied to {label}: {html.escape(str(e))}", reply_to=message_id)
         return
@@ -240,8 +292,17 @@ def main() -> None:
     store = Store()
     skip_old_updates(tg)
 
+    apply_enabled = config.get("apply", {}).get("enabled", False) and "plaza" in enabled
+    if apply_enabled:
+        plaza_session.on_login_failure = lambda reason: notify(
+            tg, f"⚠️ Plaza login failed: {html.escape(reason)}\nApply buttons won't work until it succeeds. "
+                f"I'll try again in {LOGIN_RETRY_SECONDS // 60} min (check PLAZA_USERNAME/PASSWORD in .env).")
+        warm_up_login()  # log in now, not when you tap a button in the start-up list
+
     first_round = True  # first round: a summary per site instead of per-listing messages
     while True:
+        if apply_enabled:
+            warm_up_login(SESSION_KEEPALIVE_SECONDS)  # cheap check; re-login only if it expired
         for source in sources:
             check_safely(source, store, tg, filters, announce=not first_round, config=config)
         if first_round:
