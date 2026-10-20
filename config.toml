@@ -1,7 +1,7 @@
 # Which listings you want to hear about. Empty list = no filter on that field.
 [filters]
 countries = ["Netherlands"]
-cities = ["Utrecht"]
+cities = ["Limburg"]
 
 # Which sites to watch: "plaza", "fizz"
 [sources]
