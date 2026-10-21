@@ -83,7 +83,9 @@ def http_client() -> httpx.Client:
 
 
 def get_account(client: httpx.Client) -> dict | None:
-    return client.get(ACCOUNT_URL).json().get("account")
+    resp = client.get(ACCOUNT_URL)
+    resp.raise_for_status()  # a Cloudflare block page is HTML, not JSON
+    return resp.json().get("account")
 
 
 def ensure_logged_in(headed: bool = False) -> httpx.Client:

@@ -114,6 +114,9 @@ class PlazaSession:
         try:
             self.client = ensure_logged_in()  # browser login only if the saved cookies stopped working
         except Exception as e:
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in BLOCKED_STATUSES:
+                # The site is blocking us, not rejecting the login: no lockout, no alert.
+                raise LoginError(f"Plaza is blocking requests ({e.response.status_code}); skipping login for now.")
             self.login_failed_at = time.time()
             if self.on_login_failure:
                 self.on_login_failure(str(e))
