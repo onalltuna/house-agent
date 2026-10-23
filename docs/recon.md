@@ -88,7 +88,12 @@ The login request URL is built at runtime, so it isn't visible in the static JS.
 5. Right-click → **Save all as HAR** → put it in `recon/` (it's gitignored — it contains cookies!).
 
 ### Rules / eligibility to check manually
-- Read Plaza's terms of use for any clause on automated reactions.
+- ~~Read Plaza's terms of use for any clause on automated reactions.~~ Checked 2026-10-23: Plaza
+  publishes no terms of use. The disclaimer, the whole FAQ knowledge base and the "Protocol
+  toewijzing huurwoningen" say nothing about bots or automated reactions. Relevant rules from the FAQ:
+  no cap on reactions; reactions can be withdrawn while the listing is still advertised; the offer
+  goes to the first reactor whose documents are all uploaded *and approved*; reaction speed is an
+  explicit allocation criterion ("wie het eerst komt, die het eerst maalt"); the owner makes the final choice.
 - Limapad studios target `student` only — you must be enrolled.
 
 ---

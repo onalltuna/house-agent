@@ -4,6 +4,7 @@
     uv run python -m house_agent.watch --once   # one check, then exit
 
 On start it sends the full list of matching listings; after that only changes.
+With [apply] auto = true it also reacts to the first new Plaza listing by itself, at most once an hour.
 In Telegram, send /list any time for everything currently available (one message per site),
 or /plaza, /fizz for a single site.
 Each site is checked and backed off independently, so one site failing doesn't affect the others.
@@ -14,6 +15,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Callable
 
 import httpx
@@ -71,11 +73,68 @@ def check(source: Source, store: Store, tg: Telegram, filters: Filters, announce
     if announce:
         if any(can_apply(l, config) for l in new):
             warm_up_login()
+        notes = auto_apply(store, config, new)  # before the messages: every second counts
         for l in new:
-            buttons = [("⚡ Apply now", APPLY_PREFIX + l.key)] if can_apply(l, config) else None
-            tg.send("🆕 " + format_listing(l), buttons=buttons)
+            buttons = ([("⚡ Apply now", APPLY_PREFIX + l.key)]
+                       if can_apply(l, config) and not store.has_applied(l.key) else None)
+            note = f"\n\n{notes[l.key]}" if l.key in notes else ""
+            tg.send("🆕 " + format_listing(l) + note, buttons=buttons)
         for l in gone:
             tg.send(f"❌ No longer listed on {source.name}: {l.address}, {l.city}")
+
+
+AUTO_EVERY_MINUTES = 60
+
+
+def auto_apply(store: Store, config: dict, new: list[Listing]) -> dict[str, str]:
+    """React to the first new Plaza listing Plaza accepts, at most once per `auto_every_minutes`.
+
+    Returns a status line per listing key, to add to that listing's Telegram message.
+    """
+    settings = config.get("apply", {})
+    candidates = [l for l in new if can_apply(l, config) and not store.has_applied(l.key)]
+    if not settings.get("auto", False) or not candidates:
+        return {}
+    every = settings.get("auto_every_minutes", AUTO_EVERY_MINUTES)
+    if store.auto_applied_since(datetime.now() - timedelta(minutes=every)):
+        log.info("Auto-apply: already applied in the last %d min, leaving %d new listing(s) to you",
+                 every, len(candidates))
+        return {}
+
+    notes = {}
+    for l in candidates:
+        try:
+            result = plaza_apply.react(plaza_session.get(), l.id)
+        except plaza_apply.ApplyError as e:  # nothing was sent: try the next listing
+            log.info("Auto-apply skipped %s: %s", l.key, e)
+            notes[l.key] = f"🤖 Not auto-applied: {html.escape(str(e))}"
+            continue
+        except LoginError as e:
+            log.warning("Auto-apply skipped: %s", e)
+            return notes
+        except Exception as e:
+            # The reaction may have gone out, so this counts toward the hourly limit.
+            log.exception("Auto-apply failed for %s", l.key)
+            store.record_application(l.key, False, repr(e), auto=True)
+            notes[l.key] = f"🤖 Auto-apply failed ({type(e).__name__}) — tap Apply or use the website."
+            return notes
+
+        log.info("Auto-applied %s: ok=%s in %.1fs", l.key, result.ok, result.seconds)
+        store.record_application(l.key, result.ok, result.message, auto=True)
+        if result.ok:
+            notes[l.key] = (f"🤖 Auto-applied in {result.seconds:.1f}s.{result_details(result)}\n"
+                            "Don't want it? Withdraw it under “Mijn reacties” while it's still listed.")
+        else:
+            notes[l.key] = (f"🤖 ⚠️ Auto-applied, but Plaza doesn't confirm it.{result_details(result)}\n"
+                            "Check “Mijn reacties” on the website.")
+        return notes
+    return notes
+
+
+def result_details(result: plaza_apply.ReactResult) -> str:
+    position = f"\nYour provisional position: <b>{result.position}</b>" if result.position else ""
+    plaza_says = f"\nPlaza says: {html.escape(result.message)}" if result.message else ""
+    return position + plaza_says
 
 
 SESSION_FRESH_SECONDS = 5 * 60  # trust a session we verified this recently without re-checking
@@ -153,8 +212,8 @@ def handle_apply(tg: Telegram, store: Store, config: dict, key: str, message_id:
     if store.has_applied(key):
         tg.send(f"ℹ️ You already applied to {label}.", reply_to=message_id)
         return
-    if store.applications_today() >= max_per_day:
-        tg.send(f"🛑 Daily limit of {max_per_day} applications reached — not applying to {label}. "
+    if store.taps_today() >= max_per_day:
+        tg.send(f"🛑 Daily limit of {max_per_day} Apply taps reached — not applying to {label}. "
                 "Use the link to apply on the website, or raise max_per_day in config.toml.", reply_to=message_id)
         return
 
@@ -179,12 +238,10 @@ def handle_apply(tg: Telegram, store: Store, config: dict, key: str, message_id:
         return
 
     store.record_application(key, result.ok, result.message)
-    position = f"\nYour provisional position: <b>{result.position}</b>" if result.position else ""
-    plaza_says = f"\nPlaza says: {html.escape(result.message)}" if result.message else ""
     if result.ok:
-        tg.send(f"✅ Applied to {label} in {result.seconds:.1f}s.{position}{plaza_says}", reply_to=message_id)
+        tg.send(f"✅ Applied to {label} in {result.seconds:.1f}s.{result_details(result)}", reply_to=message_id)
     else:
-        tg.send(f"⚠️ Sent the reaction for {label}, but Plaza doesn't confirm it.{plaza_says}\n"
+        tg.send(f"⚠️ Sent the reaction for {label}, but Plaza doesn't confirm it.{result_details(result)}\n"
                 "Check “Mijn reacties” on the website.", reply_to=message_id)
 
 

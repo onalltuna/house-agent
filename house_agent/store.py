@@ -28,24 +28,35 @@ class Store:
                 key TEXT NOT NULL,
                 applied_at TEXT NOT NULL,
                 ok INTEGER NOT NULL,
-                detail TEXT
+                detail TEXT,
+                auto INTEGER NOT NULL DEFAULT 0
             )"""
         )
+        # Databases created before auto-apply existed lack the column.
+        if "auto" not in {row[1] for row in self.db.execute("PRAGMA table_info(applications)")}:
+            self.db.execute("ALTER TABLE applications ADD COLUMN auto INTEGER NOT NULL DEFAULT 0")
 
     def has_applied(self, key: str) -> bool:
         return self.db.execute("SELECT 1 FROM applications WHERE key = ? AND ok = 1", (key,)).fetchone() is not None
 
-    def applications_today(self) -> int:
+    def taps_today(self) -> int:
+        """Successful applications you started with the Apply button today (auto-applies not counted)."""
         today = datetime.now().date().isoformat()
         return self.db.execute(
-            "SELECT COUNT(*) FROM applications WHERE ok = 1 AND applied_at >= ?", (today,)
+            "SELECT COUNT(*) FROM applications WHERE ok = 1 AND auto = 0 AND applied_at >= ?", (today,)
         ).fetchone()[0]
 
-    def record_application(self, key: str, ok: bool, detail: str) -> None:
+    def auto_applied_since(self, since: datetime) -> bool:
+        """Any automatic reaction that was (or may have been) sent since then."""
+        return self.db.execute(
+            "SELECT 1 FROM applications WHERE auto = 1 AND applied_at >= ?", (since.isoformat(timespec="seconds"),)
+        ).fetchone() is not None
+
+    def record_application(self, key: str, ok: bool, detail: str, auto: bool = False) -> None:
         with self.db:
             self.db.execute(
-                "INSERT INTO applications (key, applied_at, ok, detail) VALUES (?, ?, ?, ?)",
-                (key, datetime.now().isoformat(timespec="seconds"), int(ok), detail),
+                "INSERT INTO applications (key, applied_at, ok, detail, auto) VALUES (?, ?, ?, ?, ?)",
+                (key, datetime.now().isoformat(timespec="seconds"), int(ok), detail, int(auto)),
             )
 
     def listing(self, key: str) -> Listing | None:
