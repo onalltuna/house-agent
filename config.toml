@@ -20,5 +20,5 @@ auto_every_minutes = 60
 
 # Polling interval in seconds; each wait is random between min and max.
 [watch]
-interval_min = 45
-interval_max = 90
+interval_min = 4
+interval_max = 8
