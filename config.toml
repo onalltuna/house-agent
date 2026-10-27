@@ -16,7 +16,7 @@ max_per_day = 3  # safety cap on successful Apply-button taps per day (auto-appl
 # Automatic applying (Plaza only): react by itself to the first new listing Plaza accepts you for,
 # at most once per auto_every_minutes. All other new listings still get the "Apply now" button.
 auto = true
-auto_every_minutes = 60
+auto_every_minutes = 3
 
 # Polling interval in seconds; each wait is random between min and max.
 [watch]
